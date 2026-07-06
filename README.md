@@ -270,6 +270,8 @@ The allowlist and dollar-risk cap in `safety.py` are implemented in code, not pr
 
 **No live execution.** The system is decision-only. Wiring the human-approved path to Alpaca paper orders via `alpaca-py`'s `submit_order` is documented as a next step and would not require changes to any existing layer.
 
+A production version of this system, particularly the signal and calibration components, would need to be developed privately with proprietary data. The architecture shown here is the reusable, publishable part.
+
 ### Roadmap
 
 **Backtesting-calibration agent.** A fourth agent that runs only in backtest mode, with the live research and governance agents disabled to control cost. It grades historical tickets on two axes: outcome (did the trade hit target or stop) and process (was the setup sound independent of the result). The agent suggests parameter changes — NORM_SCALE, STOP_VOL_MULTIPLE, MIN_CONFIDENCE — in natural language, based on aggregate patterns rather than per-trade. Suggestions are human-gated (never auto-applied), validated out-of-sample before adoption to avoid overfitting, and the actual calibration math stays deterministic — the agent interprets the numbers, it does not compute them. This preserves the code-owns-facts, LLM-owns-judgment principle even in the calibration loop.
