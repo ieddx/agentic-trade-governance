@@ -2,15 +2,18 @@
 coordinator.py — orchestrates the full agentic governance workflow.
 
 This is the top-level entry point for running a complete trade review cycle.
-It wires together three stages that were previously independent:
+It wires together five stages in strict order:
 
-  STAGE 1  finance_core   — load market data, compute signal, produce Ticket
-  STAGE 2  research_agent — interpret market conditions, produce ResearchReport
-  STAGE 3  governance_agent — weigh ticket + research, produce GovernanceDecision
+  STAGE 1  finance_core    — load market data, compute signal, produce Ticket
+  STAGE 2  safety          — structural validation before any Gemini quota is spent
+  STAGE 3  research_agent  — interpret market conditions via MCP, produce ResearchReport
+  STAGE 4  governance_agent — weigh ticket + research, produce GovernanceDecision
+  STAGE 5  human gate      — explicit terminal confirmation before any execution
+  AUDIT    audit            — append-only log of the full run (always runs)
 
 WHY THE COORDINATOR CONTROLS DATA LOADING
 ------------------------------------------
-Both Stage 1 (produce_ticket) and Stage 2 (research_ticket) need bar data.
+Both Stage 1 (produce_ticket) and Stage 3 (research_ticket) need bar data.
 If each loaded bars independently, there is a risk of temporal inconsistency:
   - The cache could refresh between the two calls, giving them different
     snapshots of the market.
@@ -24,24 +27,52 @@ The coordinator loads bars ONCE and passes the same DataFrame to both stages,
 guaranteeing that every piece of analysis in a single workflow run describes
 the same market moment.
 
+HUMAN-IN-THE-LOOP GATE (Stage 5)
+----------------------------------
+The governance agent's "approved" decision does NOT auto-execute a trade.
+Execution always requires explicit human confirmation via a terminal prompt.
+
+Why this matters in real trading systems:
+  1. Regulatory requirement.  The SEC, FINRA, and comparable bodies require
+     "meaningful human review" for algorithmic trading systems, particularly
+     for novel or high-risk signals.  An LLM approval alone does not satisfy
+     this standard.
+  2. Model failure mode.  An LLM that approves a trade may be hallucinating,
+     misreading numbers, or reasoning from stale context.  A human glancing at
+     the summary has a last-resort chance to catch an obvious error.
+  3. Accountability.  A human pressing "y" creates a named decision point in
+     the audit log — who approved what, when, and after seeing which summary.
+     "The algorithm did it" is not an acceptable audit response.
+
+In this paper-trading system the execution step is intentionally not
+implemented.  The human gate is wired in anyway so the approval flow is tested
+and documented before any real execution is connected.
+
 FLOW
 ----
-  run_governance_workflow(ticker)
+  run_governance_workflow(ticker, as_of)
       │
-      ├─ LOAD   load_bars(ticker)           → bars  (one snapshot)
+      ├─ LOAD    load_bars(ticker)            → bars  (one snapshot)
       │
-      ├─ STAGE1 produce_ticket(bars=bars)   → Ticket   (or None if no signal)
+      ├─ STAGE1  produce_ticket(bars=bars)    → Ticket   (or None → exit)
       │
-      ├─ STAGE2 research_ticket(bars=bars)  → ResearchReport
+      ├─ STAGE2  validate_ticket(ticket)      → violations
+      │           any violations → audit + exit
       │
-      ├─ STAGE3 review_ticket(ticket,
+      ├─ STAGE3  research_ticket(bars=bars)   → ResearchReport
+      │
+      ├─ STAGE4  review_ticket(ticket,
       │                research_report=report) → GovernanceDecision
       │
-      └─ RETURN WorkflowResult(ticket, research_report, governance_decision)
+      ├─ STAGE5  _human_gate(ticket, report,
+      │                decision)              → "approved" | "rejected"
+      │
+      └─ AUDIT   log_run(...)                 → logs/audit.jsonl
 """
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -51,13 +82,15 @@ from finance_core.data_loader import load_bars
 from finance_core.core import produce_ticket
 from finance_core.ticket import Ticket
 
-# agentic_layer: research and governance agents
+# agentic_layer: safety, research, governance, audit
+from agentic_layer.safety import validate_ticket, MAX_DOLLAR_RISK, ALLOWED_TICKERS
 from agentic_layer.research_agent import research_ticket, ResearchReport
 from agentic_layer.governance_agent import review_ticket, GovernanceDecision
+from agentic_layer.audit import log_run
 
 
 # ---------------------------------------------------------------------------
-# WorkflowResult — bundles all three stage outputs into one return value.
+# WorkflowResult — bundles all stage outputs into one return value.
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -71,11 +104,83 @@ class WorkflowResult:
     ticket              : the trade proposal from the finance core.
     research_report     : market-context analysis from the research agent.
     governance_decision : approve/veto decision from the governance agent.
+    human_decision      : "approved" | "rejected" — the final human gate.
     """
     ticker:              str
     ticket:              Ticket
     research_report:     ResearchReport
     governance_decision: GovernanceDecision
+    human_decision:      str
+
+
+# ---------------------------------------------------------------------------
+# Human-in-the-loop gate
+# ---------------------------------------------------------------------------
+
+def _human_gate(
+    ticket: Ticket,
+    report: ResearchReport,
+    decision: GovernanceDecision,
+) -> str:
+    """
+    Present a concise summary and ask for explicit human confirmation.
+
+    Returns "approved" or "rejected".
+
+    HUMAN-IN-THE-LOOP RATIONALE
+    ----------------------------
+    This gate runs regardless of what the governance agent decided.  Governance
+    "approved" does NOT auto-execute.  The governance agent may be wrong, and a
+    human looking at the summary has the final say.
+
+    In a real trading system this pattern is enforced at the infrastructure
+    level (the execution API requires a signed human token), not just in
+    application code — so a bug in the coordinator cannot bypass it.  Here it
+    is implemented in the coordinator as the paper-trade analogue.
+    """
+    dollar_risk = abs(ticket.entry - ticket.stop) * ticket.size
+    gov_status  = "APPROVED ✓" if decision.approved else "VETOED ✗"
+
+    print()
+    print("=" * 60)
+    print("HUMAN APPROVAL GATE")
+    print("=" * 60)
+    print(f"  Ticker:          {ticket.ticker}")
+    print(f"  Direction:       {ticket.direction.upper()}")
+    print(f"  Size:            {ticket.size} shares")
+    print(f"  Entry:           ${ticket.entry}")
+    print(f"  Stop:            ${ticket.stop}  (−{abs(ticket.entry - ticket.stop):.4f})")
+    print(f"  Target:          ${ticket.target}  (+{abs(ticket.target - ticket.entry):.4f})")
+    print(f"  Dollar at risk:  ${dollar_risk:.2f}")
+    print(f"  Confidence:      {ticket.confidence:.2%}")
+    print()
+    print(f"  Governance:      {gov_status}")
+    print(f"  Reasoning:       {decision.reasoning}")
+    if decision.flags:
+        print(f"  Gov flags:")
+        for f in decision.flags:
+            print(f"    • {f}")
+    if report.concerns:
+        print(f"  Research concerns:")
+        for c in report.concerns:
+            print(f"    • {c}")
+    print()
+    print("  [PAPER MODE — no real order will be placed]")
+    print()
+
+    try:
+        raw = input("  Approve execution? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        raw = ""
+
+    if raw == "y":
+        print()
+        print("  HUMAN OVERRIDE: approved")
+        return "approved"
+    else:
+        print()
+        print("  HUMAN OVERRIDE: rejected")
+        return "rejected"
 
 
 # ---------------------------------------------------------------------------
@@ -85,12 +190,13 @@ class WorkflowResult:
 def run_governance_workflow(
     ticker: str = "AAPL",
     as_of: Optional[datetime] = None,
-) -> WorkflowResult | None:
+) -> Optional[WorkflowResult]:
     """
-    Run the complete three-stage governance workflow for *ticker*.
+    Run the complete five-stage governance workflow for *ticker*.
 
-    Returns a WorkflowResult on success, or None if the finance core produced
-    no ticket (signal strength below MIN_CONFIDENCE threshold).
+    Returns a WorkflowResult on completion of the human gate, or None if the
+    finance core produced no ticket (signal below MIN_CONFIDENCE) or safety
+    validation failed.
 
     Parameters
     ----------
@@ -99,59 +205,141 @@ def run_governance_workflow(
              full workflow runs as if executed at that historical moment.
              When None, current market data is used.
     """
-    _banner("DATA LOAD")
+    as_of_str = as_of.isoformat() if as_of else None
 
-    # -----------------------------------------------------------------------
-    # Load bars ONCE.  Both produce_ticket and research_ticket accept a
-    # pre-loaded DataFrame via their `bars` parameter so neither will call
-    # load_bars() again.  This is the snapshot-consistency guarantee described
-    # in the module docstring.
-    # -----------------------------------------------------------------------
-    bars, feed_used = load_bars(symbol=ticker, as_of=as_of)
-    window_label = f"as-of {as_of.isoformat()}" if as_of else "current"
-    print(f"[coordinator] Loaded {len(bars)} bars for {ticker} "
-          f"(feed: {feed_used}, window: {window_label}).")
+    # Shared audit-log fields — populated incrementally as stages complete.
+    _ticket_fields: Optional[dict]   = None
+    _safety_passed: bool             = False
+    _safety_violations: list[str]    = []
+    _research_summary: Optional[str] = None
+    _research_concerns: Optional[list] = None
+    _gov_approved: Optional[bool]    = None
+    _gov_reasoning: Optional[str]    = None
+    _gov_flags: Optional[list]       = None
+    _human_decision: str             = "not_reached"
+    _error: Optional[str]            = None
 
-    # -----------------------------------------------------------------------
-    # Stage 1 — deterministic signal + Ticket
-    # -----------------------------------------------------------------------
-    _banner("STAGE 1 — FINANCE CORE")
+    try:
+        # -------------------------------------------------------------------
+        # DATA LOAD
+        # -------------------------------------------------------------------
+        _banner("DATA LOAD")
+        bars, feed_used = load_bars(symbol=ticker, as_of=as_of)
+        window_label = f"as-of {as_of.isoformat()}" if as_of else "current"
+        print(f"[coordinator] Loaded {len(bars)} bars for {ticker} "
+              f"(feed: {feed_used}, window: {window_label}).")
 
-    ticket = produce_ticket(symbol=ticker, bars=bars)
-    if ticket is None:
-        print(
-            "[coordinator] Finance core produced no ticket "
-            "(signal confidence below threshold).  Workflow aborted."
+        # -------------------------------------------------------------------
+        # STAGE 1 — deterministic signal + Ticket
+        # -------------------------------------------------------------------
+        _banner("STAGE 1 — FINANCE CORE")
+        ticket = produce_ticket(symbol=ticker, bars=bars)
+        if ticket is None:
+            print(
+                "[coordinator] Finance core produced no ticket "
+                "(signal confidence below threshold).  Workflow aborted."
+            )
+            log_run(
+                ticker=ticker, as_of=as_of_str,
+                ticket_fields=None,
+                safety_passed=False, safety_violations=["no_ticket_produced"],
+                research_summary=None, research_concerns=None,
+                governance_approved=None, governance_reasoning=None,
+                governance_flags=None,
+                human_decision="not_reached",
+            )
+            return None
+
+        _ticket_fields = dataclasses.asdict(ticket)
+
+        # -------------------------------------------------------------------
+        # STAGE 2 — safety validation
+        # -------------------------------------------------------------------
+        _banner("STAGE 2 — SAFETY VALIDATION")
+        violations = validate_ticket(ticket)
+
+        if violations:
+            _safety_passed     = False
+            _safety_violations = violations
+            print("[coordinator] *** SAFETY VIOLATION — workflow aborted ***")
+            for v in violations:
+                print(f"  ✗  {v}")
+            log_run(
+                ticker=ticker, as_of=as_of_str,
+                ticket_fields=_ticket_fields,
+                safety_passed=False, safety_violations=violations,
+                research_summary=None, research_concerns=None,
+                governance_approved=None, governance_reasoning=None,
+                governance_flags=None,
+                human_decision="not_reached",
+            )
+            return None
+
+        _safety_passed = True
+        print("[coordinator] Safety validation passed ✓")
+        print(f"  Ticker '{ticket.ticker}' is in the allowlist.")
+        dollar_risk = abs(ticket.entry - ticket.stop) * ticket.size
+        print(f"  Dollar risk ${dollar_risk:.2f} is within the ${MAX_DOLLAR_RISK:.0f} cap.")
+        print(f"  Stop/target sides correct for {ticket.direction.upper()}.")
+        print(f"  Confidence {ticket.confidence:.2%} is within [0, 1].")
+
+        # -------------------------------------------------------------------
+        # STAGE 3 — market research (via MCP)
+        # -------------------------------------------------------------------
+        _banner("STAGE 3 — RESEARCH AGENT (via MCP)")
+        report = research_ticket(ticket, bars=bars)
+        _research_summary  = report.summary
+        _research_concerns = report.concerns
+
+        # -------------------------------------------------------------------
+        # STAGE 4 — governance decision
+        # -------------------------------------------------------------------
+        _banner("STAGE 4 — GOVERNANCE AGENT")
+        decision = review_ticket(ticket, research_report=report)
+        _gov_approved  = decision.approved
+        _gov_reasoning = decision.reasoning
+        _gov_flags     = decision.flags
+
+        # -------------------------------------------------------------------
+        # STAGE 5 — human gate (always runs, regardless of governance verdict)
+        # -------------------------------------------------------------------
+        _human_decision = _human_gate(ticket, report, decision)
+
+        # -------------------------------------------------------------------
+        # Summary print
+        # -------------------------------------------------------------------
+        result = WorkflowResult(
+            ticker=ticker,
+            ticket=ticket,
+            research_report=report,
+            governance_decision=decision,
+            human_decision=_human_decision,
         )
-        return None
+        _print_summary(result, feed_used=feed_used)
 
-    # -----------------------------------------------------------------------
-    # Stage 2 — market research
-    # The research agent receives the same `bars` snapshot that produced the
-    # ticket.  Metrics therefore describe exactly the market state the signal
-    # was computed on.
-    # -----------------------------------------------------------------------
-    _banner("STAGE 2 — RESEARCH AGENT")
+    except Exception as exc:
+        _error = f"{type(exc).__name__}: {exc}"
+        print(f"[coordinator] Unhandled error: {_error}")
+        raise
 
-    report = research_ticket(ticket, bars=bars)
+    finally:
+        # Audit log always runs — even on exceptions.
+        log_run(
+            ticker=ticker,
+            as_of=as_of_str,
+            ticket_fields=_ticket_fields,
+            safety_passed=_safety_passed,
+            safety_violations=_safety_violations,
+            research_summary=_research_summary,
+            research_concerns=_research_concerns,
+            governance_approved=_gov_approved,
+            governance_reasoning=_gov_reasoning,
+            governance_flags=_gov_flags,
+            human_decision=_human_decision,
+            error=_error,
+        )
+        print(f"\n[coordinator] Audit entry written → logs/audit.jsonl")
 
-    # -----------------------------------------------------------------------
-    # Stage 3 — governance decision
-    # The research report is passed alongside the ticket so the governance
-    # prompt includes both the trade's risk math AND the market context.
-    # -----------------------------------------------------------------------
-    _banner("STAGE 3 — GOVERNANCE AGENT")
-
-    decision = review_ticket(ticket, research_report=report)
-
-    # Bundle everything and print a human-readable summary.
-    result = WorkflowResult(
-        ticker=ticker,
-        ticket=ticket,
-        research_report=report,
-        governance_decision=decision,
-    )
-    _print_summary(result, feed_used=feed_used)
     return result
 
 
@@ -160,7 +348,6 @@ def run_governance_workflow(
 # ---------------------------------------------------------------------------
 
 def _banner(title: str) -> None:
-    """Print a section separator."""
     print()
     print("=" * 60)
     print(title)
@@ -168,7 +355,6 @@ def _banner(title: str) -> None:
 
 
 def _print_summary(result: WorkflowResult, feed_used: str = "unknown") -> None:
-    """Print a clean, readable end-of-run summary of all three stages."""
     t  = result.ticket
     rr = result.research_report
     gd = result.governance_decision
@@ -226,15 +412,14 @@ def _print_summary(result: WorkflowResult, feed_used: str = "unknown") -> None:
     else:
         print("  Flags:     (none)")
 
+    # --- Human decision ---
+    print()
+    print("HUMAN DECISION")
+    print(f"  {result.human_decision.upper()}")
+
 
 # ---------------------------------------------------------------------------
 # Entry point: python -m agentic_layer.coordinator [--ticker SYM] [--as-of DATE]
-#
-# --ticker SYMBOL          Which stock to analyse (default: AAPL).
-# --as-of "YYYY-MM-DD HH:00"  Run as if it were this historical moment.
-#   Accepts "YYYY-MM-DD HH:MM", "YYYY-MM-DD HH:00", or "YYYY-MM-DD" (date
-#   alone defaults to 16:00 ET — NYSE close — on that day).
-#   When omitted, current SIP data is used.
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -278,7 +463,6 @@ if __name__ == "__main__":
                 f"--as-of value {raw!r} could not be parsed. "
                 'Use "YYYY-MM-DD HH:MM" or "YYYY-MM-DD".'
             )
-        # Interpret as Eastern time (the natural timezone for US market hours).
         as_of_dt = parsed.replace(tzinfo=_ET)
 
     run_governance_workflow(ticker=args.ticker, as_of=as_of_dt)

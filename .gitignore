@@ -19,3 +19,6 @@ env/
 
 # Editor artefacts
 .DS_Store
+
+# Audit logs — may contain licensed market data; never commit
+logs/*.jsonl
