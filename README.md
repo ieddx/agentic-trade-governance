@@ -20,7 +20,7 @@ This project builds a governance layer between the signal and execution. The det
 
 **Deterministic Finance Core** (`finance_core/`)
 
-The finance core loads hourly OHLCV bars, computes a moving-average crossover signal, and produces a `Ticket`: a fully specified trade proposal with entry, stop, target, size, and confidence. No LLM is involved at any point. All numbers are computed by code and are reproducible given the same input data.
+The finance core loads hourly OHLCV bars, computes a moving-average crossover signal, and produces a `Ticket`: a fully specified trade proposal with entry, stop, target, size, and confidence. No LLM is involved at any point. All numbers are computed by code and are reproducible given the same input data. Nothing is guessed. Nothing is approximated.
 
 Key design choices in the core:
 - Confidence is volatility-normalized: `ma_separation / recent_hourly_vol`, scaled to a `[0, 0.85]` range. A strong crossover in a calm market scores higher than the same crossover in a volatile one.
@@ -39,7 +39,7 @@ The flow through the agentic layer is enforced by the coordinator in strict orde
 
 3. **Governance agent** (`governance_agent.py`): receives the ticket and the research report, asks Gemini to approve or veto with explicit reasoning and structured flags. The prompt includes the full confidence breakdown and the dynamic volatility-scaled barrier distances so Gemini reasons about the actual parameters, not generic ones.
 
-4. **Human gate** (`coordinator.py`): the governance decision is presented to the human alongside the dollar risk, research concerns, and governance flags. The human types `y` or `N`. Governance "approved" does not auto-execute. The human is always the final gate.
+4. **Human gate** (`coordinator.py`): the governance decision is presented to the human alongside the dollar risk, research concerns, and governance flags. The human types `y` or `N`. That is the entire interface. Governance "approved" does not auto-execute. The human is always the final gate.
 
 5. **Audit log** (`audit.py`): every run appends a JSON record to `logs/audit.jsonl`, capturing all fields from all stages, the human decision, and any errors. The log writes in a `finally` block so it fires even on crashes.
 
@@ -114,7 +114,7 @@ The market-context computation is exposed as a typed MCP tool via a stdio-transp
 | `mcp_server/client.py` | Standalone MCP client (Python 3.11). Called as a subprocess by the research agent; connects to the server over stdio, calls the tool, writes JSON to stdout. |
 | `agentic_layer/research_agent.py` | Calls `python3.11 -m mcp_server.client TICKER` via subprocess; parses the JSON result; logs `"MCP tool called: get_market_context"` on success. Falls back to the direct import if the subprocess fails. |
 
-The MCP architecture means that any other MCP-speaking agent (a portfolio agent, a reporting agent, an external system) could call `get_market_context` without importing Python code directly. The tool is self-describing: its parameter schema and description are announced at connection time.
+The MCP architecture means that any other MCP-speaking agent (a portfolio agent, a reporting agent, an external system) could call `get_market_context` without importing Python code directly. The tool is self-describing: its parameter schema and description are announced at connection time. Any MCP client can discover it.
 
 **Note on the Python version split:** the `mcp` package requires Python 3.10+. The rest of the project runs on Python 3.9 (macOS system Python). The server and client run as subprocesses under Python 3.11 (Homebrew); the coordinator runs under Python 3.9. They communicate over subprocess stdio. This is standard MCP architecture: the server and client are separate processes and can use different runtimes.
 
@@ -133,11 +133,11 @@ MAX_DOLLAR_RISK = 500.0
 
 **Human-in-the-loop gate** (`agentic_layer/coordinator.py`, `_human_gate()`):
 
-Governance approval does not execute. Every run reaches a terminal prompt showing the ticker, direction, size, dollar risk, governance decision, governance flags, and research concerns. The default answer is `N`. A human must type `y` to proceed. This pattern is required in real trading systems for regulatory compliance and to provide a named decision point in the audit trail.
+Governance approval does not execute. Every run reaches a terminal prompt showing the ticker, direction, size, dollar risk, governance decision, governance flags, and research concerns. The default answer is `N`. Silence is a rejection. A human must type `y` to proceed. This pattern is required in real trading systems for regulatory compliance and to provide a named decision point in the audit trail.
 
 **Audit trail** (`agentic_layer/audit.py`):
 
-Every run appends one JSON record to `logs/audit.jsonl`. The record captures the UTC timestamp, ticker, as_of, all ticket fields, safety pass/fail with violation strings, research summary and concerns, governance decision with reasoning and flags, and the human's decision. The file is append-only; the directory is excluded from git. In a production system this would write to an immutable store with signed entries; here it is the closest paper-trade analogue.
+Every run appends one JSON record to `logs/audit.jsonl`. The record captures the UTC timestamp, ticker, as_of, all ticket fields, safety pass/fail with violation strings, research summary and concerns, governance decision with reasoning and flags, and the human's decision. The file is append-only; the directory is excluded from git. In a production system this would write to an immutable store with signed entries; here it is the equivalent within this prototype's scope.
 
 ---
 
@@ -227,36 +227,36 @@ cat logs/audit.jsonl | tail -1 | python3 -m json.tool
 
 ---
 
+## Findings: What the Agents Caught
+
+Running the system on real data surfaces two substantive defects that I then fixed. Both were caught by the agents.
+
+**Defect 1: Binary confidence (always 1.0).**
+The original signal always returned `confidence=1.0`. The governance agent flagged this immediately: "a maxed-out score suggests the signal may be overfitting or poorly calibrated." The flag was correct. Confidence was binary: crossover present means 1.0. I replaced it with a volatility-normalized score: MA separation divided by recent hourly volatility, mapped to `[0, 0.85]`. Typical scores now range from 14% (NVDA, weak crossover) to 74% (AAPL, strong crossover relative to vol). The ceiling is 0.85, not 1.0, because the governance agent correctly identified 1.0 as implausible for a two-MA crossover.
+
+**Defect 2: Fixed stop too tight for hourly volatility.**
+With a 75bps fixed stop and typical AAPL hourly moves of 80-105bps, the stop was inside the bar's own noise. The governance agent flagged this in the risk parameters section. I switched to `STOP_VOL_MULTIPLE = 2.0`: for AAPL at 1.05%/hr volatility, the stop is now 2.10% below entry (210bps), which clears two typical hourly moves. TSLA at 1.82%/hr gets a 3.64% stop. The barriers now adapt to each instrument's volatility regime — the same crossover gets a tighter stop in a calm stock and a wider one in a volatile one. The barriers adapt to the instrument and regime automatically.
+
+After both fixes, the governance agent's veto reason changed from "stop too tight" to a current legitimate concern: AAPL is trading at 0.96 of its 24-hour range, creating reversal risk for a buy entry. This is real risk assessment, not calibration failure. The agent is doing its job.
+
+---
+
 ## Key Design Decisions
 
 **LLMs never compute numbers.**
-Gemini is asked to interpret metrics and produce a judgment, not to calculate stop distances, confidence scores, or position sizes. LLMs are unreliable at exact arithmetic, and trading risk math requires exact arithmetic. The finance core owns all numbers; agents receive them as structured facts.
+Gemini is asked to interpret metrics and produce a judgment, not to calculate stop distances, confidence scores, or position sizes. LLMs are unreliable at exact arithmetic, and trading risk math requires exact arithmetic. The finance core owns all numbers; agents receive them as structured facts. The distinction is intentional.
 
 **Volatility-scaled barriers replaced fixed basis points.**
-The original stop-loss was fixed at 75 basis points. The governance agent flagged this as a problem: for AAPL, a typical hourly move was 80-105 bps, meaning the stop sat inside the noise floor and would be hit by random fluctuation before the signal could be evaluated. I replaced it with `STOP_VOL_MULTIPLE = 2.0`: stop = 2x recent hourly volatility, target = 4x. This is the Lopez de Prado triple-barrier approach applied to the calibration data. The governance agent's criticism surfaced a real defect in the strategy design, which is the value story for this project.
+The original stop-loss was fixed at 75 basis points. The governance agent flagged this as a problem: for AAPL, a typical hourly move was 80-105 bps, meaning the stop sat inside the noise floor and would be hit by random fluctuation before the signal could be evaluated. I replaced it with `STOP_VOL_MULTIPLE = 2.0`: stop = 2x recent hourly volatility, target = 4x. The barriers now adapt to each instrument's volatility regime — the same crossover gets a tighter stop in a calm stock and a wider one in a volatile one. The governance agent's criticism surfaced a real defect in the strategy design, which is the value story for this project.
 
 **Single data snapshot.**
-The coordinator loads bars once and passes the same DataFrame to every stage. Without this, the CSV cache could refresh between the finance core and the research agent, giving them different views of the market. The governance agent would then compare a ticket computed at time T against research at T+delta.
+The coordinator loads bars once and passes the same DataFrame to every stage. Without this, the CSV cache could refresh between the finance core and the research agent, giving them different views of the market. The governance agent would then compare a ticket computed at time T against research at T+delta. That is not the same market.
 
 **Human always the final gate.**
 Governance approval does not auto-execute. A human looking at the dollar risk, the governance flags, and the research concerns has a last-resort chance to catch an error that every other layer missed. In a live system, this would be enforced at the execution API level, not just in application code.
 
 **Deterministic security checks.**
 The allowlist and dollar-risk cap in `safety.py` are implemented in code, not prompted to an LLM. An LLM asked "is this ticker safe?" might approve a name not in the allowlist. A `frozenset` lookup does not.
-
----
-
-## Findings: What the Agents Caught
-
-Running the system on real data surfaces two substantive defects that I then fixed.
-
-**Defect 1: Binary confidence (always 1.0).**
-The original signal always returned `confidence=1.0`. The governance agent flagged this immediately: "a maxed-out score suggests the signal may be overfitting or poorly calibrated." The flag was correct. Confidence was binary: crossover present means 1.0. I replaced it with a volatility-normalized score: MA separation divided by recent hourly volatility, mapped to `[0, 0.85]`. Typical scores now range from 14% (NVDA, weak crossover) to 74% (AAPL, strong crossover relative to vol). The ceiling is 0.85, not 1.0, because the governance agent correctly identified 1.0 as implausible for a two-MA crossover.
-
-**Defect 2: Fixed stop too tight for hourly volatility.**
-With a 75bps fixed stop and typical AAPL hourly moves of 80-105bps, the stop was inside the bar's own noise. The governance agent flagged this in the risk parameters section. I switched to `STOP_VOL_MULTIPLE = 2.0`: for AAPL at 1.05%/hr volatility, the stop is now 2.10% below entry (210bps), which clears two typical hourly moves. TSLA at 1.82%/hr gets a 3.64% stop. The barriers adapt to the instrument and regime automatically.
-
-After both fixes, the governance agent's veto reason changed from "stop too tight" to a current legitimate concern: AAPL is trading at 0.96 of its 24-hour range, creating reversal risk for a buy entry. This is real risk assessment, not calibration failure.
 
 ---
 
@@ -272,7 +272,7 @@ After both fixes, the governance agent's veto reason changed from "stop too tigh
 
 ### Roadmap
 
-**Backtesting-calibration agent.** A fourth agent that grades historical tickets against their outcomes: did the price reach the target before the stop? Did confidence predict win rate? The agent would suggest parameter changes (NORM_SCALE, STOP_VOL_MULTIPLE, MIN_CONFIDENCE) based on outcome data, with changes gated by human approval and validated out-of-sample before adoption. This closes the feedback loop between governance reasoning and strategy parameters.
+**Backtesting-calibration agent.** A fourth agent that runs only in backtest mode, with the live research and governance agents disabled to control cost. It grades historical tickets on two axes: outcome (did the trade hit target or stop) and process (was the setup sound independent of the result). The agent suggests parameter changes — NORM_SCALE, STOP_VOL_MULTIPLE, MIN_CONFIDENCE — in natural language, based on aggregate patterns rather than per-trade. Suggestions are human-gated (never auto-applied), validated out-of-sample before adoption to avoid overfitting, and the actual calibration math stays deterministic — the agent interprets the numbers, it does not compute them. This preserves the code-owns-facts, LLM-owns-judgment principle even in the calibration loop.
 
 **Web UI.** A thin presentation layer over the working system: display the ticket, research report, and governance decision in a browser; capture the human approval click instead of a terminal prompt; show the audit log as a searchable table.
 
