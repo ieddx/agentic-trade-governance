@@ -7,9 +7,11 @@ The idea is easy to understand:
   - When the short MA is above the long MA, the recent trend is up → "buy".
   - When the short MA is below the long MA, the recent trend is down → "sell".
 
-We also produce a *confidence* value between 0 and 1.  Confidence is derived
-from how far apart the two MAs are relative to the recent price level: a
-larger spread means a stronger, more convincing crossover.
+Confidence is volatility-normalised: the raw MA separation (as % of price) is
+divided by the recent hourly return volatility so that the same dollar gap
+means less in a high-vol market than in a calm one.  The result is mapped to
+[0, MAX_CONFIDENCE=0.85] — never 1.0, because a maxed-out score would flag as
+overfitting to the governance agent.
 
 This is intentionally simple.  A real system would add filters, regime
 detection, and walk-forward validation.  The goal here is a clear, testable
@@ -26,13 +28,30 @@ import pandas as pd
 SHORT_WINDOW: int = 8
 LONG_WINDOW:  int = 24
 
-# Confidence is capped at 1.0 and scaled by this normalisation factor.
-# It represents the MA spread (as % of price) that we consider "maximum
-# conviction".  0.5 % spread → confidence 1.0 after sigmoid scaling.
-CONFIDENCE_SCALE: float = 0.005   # 0.5 % of price
+# Number of recent bars used to estimate volatility (matches market_context.py).
+VOL_LOOKBACK: int = 24
+
+# A normalised score of NORM_SCALE maps to MAX_CONFIDENCE.
+# normalised_score = ma_separation_fraction / recent_volatility_fraction.
+#
+# History: initially 2.0, which caused all typical scores (2–3.5×) to clip
+# at MAX_CONFIDENCE — confidence never discriminated between weak and strong
+# signals.  Raised to 4.0 so typical scores span the full 0.4–0.85 range.
+# At NORM_SCALE=4.0, you need a separation equal to 4× the typical hourly
+# move to reach maximum confidence, which is a genuinely strong crossover.
+NORM_SCALE: float = 4.0
+
+# Confidence is capped below 1.0.  A score of 1.0 would indicate perfect
+# certainty, which is implausible for a two-MA crossover and is penalised
+# by the governance agent as a sign of overfitting.
+MAX_CONFIDENCE: float = 0.85
+
+# Fallback volatility used when there are too few bars to estimate vol; kept
+# low so confidence degrades gracefully rather than blowing up on thin data.
+_FALLBACK_VOL: float = 0.001   # 0.1 % per bar
 
 
-def compute_signal(bars: pd.DataFrame) -> tuple[str, float]:
+def compute_signal(bars: pd.DataFrame) -> tuple[str, float, dict]:
     """
     Compute the MA-crossover signal from a bar DataFrame.
 
@@ -43,7 +62,11 @@ def compute_signal(bars: pd.DataFrame) -> tuple[str, float]:
     Returns
     -------
     direction  : "buy" or "sell"
-    confidence : float in [0, 1]
+    confidence : float in [0, MAX_CONFIDENCE]
+    breakdown  : dict of deterministic intermediate values used to derive
+                 confidence.  These are computed entirely in code — no LLM
+                 involvement.  Agents interpret these facts but never generate
+                 them.
     """
     if len(bars) < LONG_WINDOW:
         raise ValueError(
@@ -60,26 +83,46 @@ def compute_signal(bars: pd.DataFrame) -> tuple[str, float]:
     long_ma  = close.rolling(window=LONG_WINDOW).mean()
 
     # --- Step 2: look at the most recent bar ---
-    latest_short = short_ma.iloc[-1]
-    latest_long  = long_ma.iloc[-1]
-    latest_close = close.iloc[-1]
+    latest_short = float(short_ma.iloc[-1])
+    latest_long  = float(long_ma.iloc[-1])
+    latest_close = float(close.iloc[-1])
 
     # --- Step 3: determine direction ---
-    # If the fast MA is above the slow MA, prices have recently risen faster
-    # than the longer-term average → bullish crossover.
     direction = "buy" if latest_short > latest_long else "sell"
 
-    # --- Step 4: compute confidence ---
-    # Spread is how much the two MAs differ, expressed as a fraction of price.
-    # E.g. short=210, long=209, close=210 → spread = 1/210 ≈ 0.0048.
-    raw_spread = abs(latest_short - latest_long) / latest_close
+    # --- Step 4: raw MA separation as a fraction of price ---
+    ma_separation = abs(latest_short - latest_long) / latest_close  # unitless fraction
 
-    # Map the spread to [0, 1] using a sigmoid-like clamp.
-    # We use a simple linear clip: spread / CONFIDENCE_SCALE, capped at 1.0.
-    # You could substitute a proper sigmoid if you want smoother gradients.
-    confidence = min(raw_spread / CONFIDENCE_SCALE, 1.0)
+    # --- Step 5: recent hourly volatility (std dev of % returns) ---
+    # Use VOL_LOOKBACK+1 rows so pct_change() produces VOL_LOOKBACK observations,
+    # matching the approach in market_context.py.
+    vol_tail = close.tail(VOL_LOOKBACK + 1)
+    if len(vol_tail) >= 2:
+        recent_vol = float(vol_tail.pct_change().dropna().std())
+    else:
+        recent_vol = _FALLBACK_VOL
 
-    # Round for readability.
+    if recent_vol <= 0:
+        recent_vol = _FALLBACK_VOL
+
+    # --- Step 6: volatility-normalised score and final confidence ---
+    # How many typical hourly moves does the MA gap represent?
+    # A large normalised score means the signal stands well above the noise.
+    normalized_score = ma_separation / recent_vol
+
+    # Map [0, NORM_SCALE] → [0, MAX_CONFIDENCE].  Values above NORM_SCALE are
+    # clipped at MAX_CONFIDENCE so confidence never reaches 1.0.
+    confidence = min(normalized_score / NORM_SCALE * MAX_CONFIDENCE, MAX_CONFIDENCE)
     confidence = round(confidence, 4)
 
-    return direction, confidence
+    # --- Step 7: build the breakdown dict ---
+    # All values are deterministic facts derived from price data.  No LLM
+    # is involved in computing them; agents interpret but never generate them.
+    breakdown: dict = {
+        "ma_separation_pct":    round(ma_separation * 100, 4),   # % of price
+        "recent_volatility_pct": round(recent_vol * 100, 4),     # % per bar (hourly)
+        "normalized_score":     round(normalized_score, 4),       # separation / vol
+        "confidence":           confidence,
+    }
+
+    return direction, confidence, breakdown

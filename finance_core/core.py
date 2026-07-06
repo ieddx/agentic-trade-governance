@@ -44,8 +44,8 @@ def produce_ticket(symbol: str = "AAPL", bars=None) -> Ticket | None:
         bars = load_bars(symbol=symbol)
 
     # --- Step 2: compute the signal ---
-    # signal.py returns a (direction, confidence) pair.
-    direction, confidence = compute_signal(bars)
+    # signal.py returns (direction, confidence, breakdown).
+    direction, confidence, breakdown = compute_signal(bars)
 
     print(
         f"[core] Signal: direction={direction!r}, confidence={confidence:.4f} "
@@ -66,6 +66,8 @@ def produce_ticket(symbol: str = "AAPL", bars=None) -> Ticket | None:
         direction=direction,
         entry=entry_price,
         confidence=confidence,
+        recent_vol_pct=breakdown["recent_volatility_pct"],
+        confidence_breakdown=breakdown,
     )
 
     print("[core] Ticket produced:")
@@ -78,4 +80,7 @@ def produce_ticket(symbol: str = "AAPL", bars=None) -> Ticket | None:
 # Allow running this file directly:  python -m finance_core.core
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    produce_ticket()
+    from finance_core.data_loader import load_bars as _load
+    _bars, _feed = _load()
+    print(f"[__main__] feed: {_feed}")
+    produce_ticket(bars=_bars)

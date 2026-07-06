@@ -43,6 +43,8 @@ FLOW
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
 
 # finance_core: data loading + ticket production
 from finance_core.data_loader import load_bars
@@ -80,7 +82,10 @@ class WorkflowResult:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def run_governance_workflow(ticker: str = "AAPL") -> WorkflowResult | None:
+def run_governance_workflow(
+    ticker: str = "AAPL",
+    as_of: Optional[datetime] = None,
+) -> WorkflowResult | None:
     """
     Run the complete three-stage governance workflow for *ticker*.
 
@@ -90,6 +95,9 @@ def run_governance_workflow(ticker: str = "AAPL") -> WorkflowResult | None:
     Parameters
     ----------
     ticker : equity symbol to analyse (default "AAPL")
+    as_of  : tz-aware datetime; when provided, bars end at this point so the
+             full workflow runs as if executed at that historical moment.
+             When None, current market data is used.
     """
     _banner("DATA LOAD")
 
@@ -99,8 +107,10 @@ def run_governance_workflow(ticker: str = "AAPL") -> WorkflowResult | None:
     # load_bars() again.  This is the snapshot-consistency guarantee described
     # in the module docstring.
     # -----------------------------------------------------------------------
-    bars = load_bars(symbol=ticker)
-    print(f"[coordinator] Loaded {len(bars)} bars for {ticker}.")
+    bars, feed_used = load_bars(symbol=ticker, as_of=as_of)
+    window_label = f"as-of {as_of.isoformat()}" if as_of else "current"
+    print(f"[coordinator] Loaded {len(bars)} bars for {ticker} "
+          f"(feed: {feed_used}, window: {window_label}).")
 
     # -----------------------------------------------------------------------
     # Stage 1 — deterministic signal + Ticket
@@ -141,7 +151,7 @@ def run_governance_workflow(ticker: str = "AAPL") -> WorkflowResult | None:
         research_report=report,
         governance_decision=decision,
     )
-    _print_summary(result)
+    _print_summary(result, feed_used=feed_used)
     return result
 
 
@@ -157,7 +167,7 @@ def _banner(title: str) -> None:
     print("=" * 60)
 
 
-def _print_summary(result: WorkflowResult) -> None:
+def _print_summary(result: WorkflowResult, feed_used: str = "unknown") -> None:
     """Print a clean, readable end-of-run summary of all three stages."""
     t  = result.ticket
     rr = result.research_report
@@ -174,6 +184,17 @@ def _print_summary(result: WorkflowResult) -> None:
     print(f"  Target:     ${t.target}")
     print(f"  Confidence: {t.confidence:.2%}")
     print(f"  Size:       {t.size} shares")
+    bd = t.confidence_breakdown
+    if bd:
+        print(f"  Confidence breakdown (deterministic, no LLM):")
+        print(f"    MA separation:    {bd.get('ma_separation_pct')}% of price")
+        print(f"    Recent vol:       {bd.get('recent_volatility_pct')}% / hr")
+        print(f"    Normalized score: {bd.get('normalized_score')} (sep / vol)")
+        print(f"  Barrier distances (vol-scaled):")
+        print(f"    Stop:   {bd.get('stop_distance_pct')}%  "
+              f"({bd.get('stop_vol_multiple')}× vol)")
+        print(f"    Target: {bd.get('target_distance_pct')}%  (2× stop, 2:1 R:R)")
+    print(f"  Data feed:  {feed_used}")
 
     # --- Research ---
     print()
@@ -207,8 +228,57 @@ def _print_summary(result: WorkflowResult) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Entry point: python -m agentic_layer.coordinator
+# Entry point: python -m agentic_layer.coordinator [--ticker SYM] [--as-of DATE]
+#
+# --ticker SYMBOL          Which stock to analyse (default: AAPL).
+# --as-of "YYYY-MM-DD HH:00"  Run as if it were this historical moment.
+#   Accepts "YYYY-MM-DD HH:MM", "YYYY-MM-DD HH:00", or "YYYY-MM-DD" (date
+#   alone defaults to 16:00 ET — NYSE close — on that day).
+#   When omitted, current SIP data is used.
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    run_governance_workflow(ticker="AAPL")
+    import argparse
+    import zoneinfo
+
+    _ET = zoneinfo.ZoneInfo("America/New_York")
+
+    parser = argparse.ArgumentParser(
+        description="Run the agentic trade-governance workflow."
+    )
+    parser.add_argument(
+        "--ticker", default="AAPL",
+        help="Equity symbol to analyse (default: AAPL)",
+    )
+    parser.add_argument(
+        "--as-of", dest="as_of", default=None,
+        metavar="DATETIME",
+        help=(
+            'Historical cutoff, e.g. "2025-09-15 14:00" or "2025-09-15". '
+            "Date-only defaults to 16:00 ET (NYSE close). "
+            "When omitted, current SIP data is used."
+        ),
+    )
+    args = parser.parse_args()
+
+    as_of_dt: Optional[datetime] = None
+    if args.as_of:
+        raw = args.as_of.strip()
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:00", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                if fmt == "%Y-%m-%d":
+                    parsed = parsed.replace(hour=16, minute=0)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            parser.error(
+                f"--as-of value {raw!r} could not be parsed. "
+                'Use "YYYY-MM-DD HH:MM" or "YYYY-MM-DD".'
+            )
+        # Interpret as Eastern time (the natural timezone for US market hours).
+        as_of_dt = parsed.replace(tzinfo=_ET)
+
+    run_governance_workflow(ticker=args.ticker, as_of=as_of_dt)

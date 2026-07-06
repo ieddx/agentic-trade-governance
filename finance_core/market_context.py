@@ -77,7 +77,7 @@ def get_market_context(ticker: str, bars=None) -> dict:
         significant mean-reversion risk if the range-high acts as resistance.
     """
     if bars is None:
-        bars = load_bars(symbol=ticker)
+        bars, _ = load_bars(symbol=ticker)
 
     # Take LOOKBACK_BARS + 1 rows so that pct_change() (which loses one row)
     # still produces exactly LOOKBACK_BARS return observations.

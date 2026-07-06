@@ -82,6 +82,8 @@ def _build_prompt(ticket, research_report=None) -> str:
     target_pct  = abs(ticket.target - ticket.entry) / ticket.entry * 100
     rr_ratio    = target_pct / stop_pct if stop_pct else 0
     dollar_risk = abs(ticket.entry - ticket.stop) * ticket.size
+    # Breakdown dict drives the dynamic RISK PARAMETERS section in the prompt.
+    bd = ticket.confidence_breakdown
 
     # --- optional research-context block ---
     # Built as plain strings before the outer f-string so their content is
@@ -145,8 +147,8 @@ Position size:   {ticket.size} shares
 Dollar at risk:  ${dollar_risk:.2f}  (stop distance × shares)
 
 --- RISK PARAMETERS (set by finance core, not modifiable) ---
-Stop-loss distance:    0.75% below entry  (75 bps)
-Take-profit distance:  1.50% above entry  (150 bps)
+Stop-loss distance:    {stop_pct:.2f}% from entry  (volatility-scaled: {bd.get("stop_vol_multiple", 2.0):.1f}× recent hourly vol of {bd.get("recent_volatility_pct", "?")}%/hr)
+Take-profit distance:  {target_pct:.2f}% from entry  (2× stop, preserving 2:1 reward:risk)
 Max holding period:    24 hours
 {research_section}
 --- YOUR TASK ---
@@ -159,7 +161,7 @@ Reason about the following:
 {research_task}
 Return a JSON object with exactly these keys — no markdown fences:
   "approved"  : true or false
-  "reasoning" : a concise paragraph explaining your decision
+  "reasoning" : 2-3 sentences maximum explaining your decision (be concise)
   "flags"     : a JSON array of short strings, one per concern (can be [])
 """.strip()
 
@@ -218,7 +220,7 @@ def review_ticket(ticket, research_report=None) -> GovernanceDecision:
     ctx = "with research context" if research_report is not None else "no research context"
     prompt = _build_prompt(ticket, research_report)
     print(f"[governance] Sending ticket to Gemini ({GEMINI_MODEL}) for review ({ctx}) …")
-    raw_text = generate(prompt)
+    raw_text = generate(prompt, max_tokens=4096)
     print("[governance] Gemini responded.")
     return _parse_response(raw_text)
 
