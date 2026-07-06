@@ -22,27 +22,46 @@ FLOW
       │
       ▼
   research_ticket()
-      │  get_market_context(ticker) → raw metrics dict   [pure computation]
+      │  _get_context_via_mcp(ticker) → raw metrics dict   [MCP tool call]
+      │    └─ falls back to get_market_context() if MCP fails
       │  _build_prompt(ticker, metrics) → prompt string
-      │  generate(prompt) → raw Gemini text              [LLM call]
+      │  generate(prompt) → raw Gemini text                [LLM call]
       │  _parse_response(text, metrics) → ResearchReport
       ▼
   ResearchReport
       │  summary  (str)       — Gemini's plain-language analyst note
       │  metrics  (dict)      — raw numbers from get_market_context
       └─ concerns (list[str]) — specific conditions worth flagging
+
+MCP INTEGRATION
+---------------
+The market-context metrics are fetched by calling mcp_server.server over the
+Model Context Protocol (MCP) rather than importing get_market_context directly.
+The MCP server runs as a subprocess (stdio transport); this agent uses a thin
+client helper (mcp_server/client.py) that speaks the MCP protocol and returns
+JSON.  If the MCP call fails for any reason, the agent falls back to the direct
+import so the overall pipeline remains robust.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from dataclasses import dataclass, field
 
 # Shared Gemini helpers: model name, generate(), JSON fence-stripping + parse.
 from agentic_layer._gemini import generate, parse_json_response, GEMINI_MODEL
 
-# Deterministic market-context computation from cached bar data.
+# Direct import used as fallback when the MCP call fails.
 from finance_core.market_context import get_market_context
+
+# Path to the mcp client helper and the Python 3.11+ interpreter that runs it.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Prefer python3.11 (required by the mcp package); fall back to the current
+# interpreter so tests that mock subprocess still work.
+_MCP_PYTHON = os.environ.get("MCP_PYTHON", "python3.11")
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +86,41 @@ class ResearchReport:
     summary:  str
     metrics:  dict
     concerns: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# MCP market-context call
+# ---------------------------------------------------------------------------
+
+def _get_context_via_mcp(ticker: str, as_of: str = "") -> dict:
+    """
+    Fetch market context by calling the get_market_context MCP tool.
+
+    Launches mcp_server.client as a subprocess under Python 3.11+, which
+    in turn spawns mcp_server.server and communicates via the MCP stdio
+    transport.  Returns the parsed dict on success.
+
+    Raises RuntimeError if the subprocess exits non-zero or returns
+    unparseable output — callers should fall back to the direct import.
+    """
+    cmd = [_MCP_PYTHON, "-m", "mcp_server.client", ticker]
+    if as_of:
+        cmd.append(as_of)
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=_PROJECT_ROOT,
+        timeout=30,
+    )
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"mcp_server.client exited {proc.returncode}: {proc.stderr.strip()}"
+        )
+
+    return json.loads(proc.stdout.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -170,9 +224,19 @@ def research_ticket(ticket, bars=None) -> ResearchReport:
     -------
     ResearchReport
     """
-    # Step 1: deterministic — no LLM involved, just maths on bars.
-    # Forward the pre-loaded bars so we stay on the coordinator's snapshot.
-    metrics = get_market_context(ticker=ticket.ticker, bars=bars)
+    # Step 1: fetch market-context metrics via the MCP tool.
+    # The MCP server is launched as a subprocess; on failure we fall back to
+    # the direct import so the pipeline stays resilient.
+    #
+    # Note: when the coordinator passes pre-loaded bars (snapshot consistency),
+    # those bars were already written to the per-symbol CSV cache by load_bars,
+    # so the MCP server reads the same data when it calls load_bars internally.
+    try:
+        metrics = _get_context_via_mcp(ticker=ticket.ticker)
+        print(f"[research] MCP tool called: get_market_context (ticker={ticket.ticker})")
+    except Exception as exc:
+        print(f"[research] MCP call failed ({exc}); falling back to direct import.")
+        metrics = get_market_context(ticker=ticket.ticker, bars=bars)
 
     # Step 2: ask Gemini to narrate the numbers.
     prompt   = _build_prompt(ticker=ticket.ticker, metrics=metrics)

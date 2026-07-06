@@ -4,3 +4,4 @@ pandas
 scikit-learn
 pytest
 google-genai
+mcp>=1.0.0  # requires Python 3.10+; install with: python3.11 -m pip install mcp
